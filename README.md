@@ -407,13 +407,27 @@ func signUp(
 ) async throws -> DLAuthResponse
 ```
 
-#### signIn(email:password:)
-Sign in an existing user.
+#### signIn(identifier:password:type:)
+Sign in an existing user with email or username.
 
 ```swift
 func signIn(
-    email: String,
-    password: String
+    identifier: String,
+    password: String,
+    type: SignInIdentifierType = .email
+) async throws -> DLAuthResponse
+
+// SignInIdentifierType options:
+// - .email (default)
+// - .username
+```
+
+#### signIn(credentials:)
+Sign in with custom credentials (advanced).
+
+```swift
+func signIn<T: Encodable & Sendable>(
+    credentials: T
 ) async throws -> DLAuthResponse
 ```
 
