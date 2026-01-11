@@ -9,7 +9,7 @@ A powerful, flexible authentication SDK for SwiftUI applications, similar to Sup
 - Password management (forgot, reset, update)
 - Session management with automatic token refresh
 - Secure token storage using Keychain
-- Auth state listeners using Combine
+- Simple auth state change listeners
 - SwiftUI integration with `@ObservableObject`
 - Fully customizable API endpoints
 - Type-safe API with modern Swift concurrency
@@ -320,14 +320,11 @@ if let token = authManager.getAccessToken() {
 
 ### Auth State Listener
 
-Listen to authentication state changes using Combine:
+Listen to authentication state changes with a simple callback:
 
 ```swift
-import Combine
-
 class AuthViewModel: ObservableObject {
     @Published var isAuthenticated = false
-    private var cancellables = Set<AnyCancellable>()
     private let authManager: DLAuthManager
 
     init(authManager: DLAuthManager) {
@@ -336,10 +333,21 @@ class AuthViewModel: ObservableObject {
     }
 
     private func setupAuthListener() {
-        authManager.onAuthStateChange { [weak self] state in
+        authManager.onAuthStateChange { [weak self] state, session in
             switch state {
-            case .signedIn(let session):
-                print("User signed in: \(session.user?.email ?? "unknown")")
+            case .initialSession:
+                // Fired immediately when listener is attached
+                // Check if session exists and is valid
+                if let session = session, session.notExpired {
+                    print("Session restored: \(session.user?.email ?? "unknown")")
+                    self?.isAuthenticated = true
+                } else {
+                    print("No valid session on load")
+                    self?.isAuthenticated = false
+                }
+
+            case .signedIn:
+                print("User signed in: \(session?.user?.email ?? "unknown")")
                 self?.isAuthenticated = true
 
             case .signedOut:
@@ -351,7 +359,187 @@ class AuthViewModel: ObservableObject {
                 self?.isAuthenticated = false
             }
         }
-        .store(in: &cancellables)
+    }
+}
+```
+
+**Note**: Only one handler can be active at a time. Setting a new handler will replace the previous one.
+
+### Making Authenticated API Requests
+
+DLAuthManager automatically handles authentication for your API calls. No need to manually add Bearer tokens!
+
+```swift
+struct Story: Codable {
+    let id: String
+    let title: String
+    let content: String
+}
+
+struct UserStoriesView: View {
+    @EnvironmentObject var authManager: DLAuthManager
+    @State private var stories: [Story] = []
+
+    var body: some View {
+        List(stories, id: \.id) { story in
+            VStack(alignment: .leading) {
+                Text(story.title).font(.headline)
+                Text(story.content).font(.caption)
+            }
+        }
+        .task {
+            await loadStories()
+        }
+    }
+
+    private func loadStories() async {
+        do {
+            // DLAuthManager automatically adds the Bearer token!
+            let response: [Story] = try await authManager.get(path: "/api/user/stories")
+            stories = response
+        } catch {
+            print("Error loading stories: \(error)")
+        }
+    }
+}
+```
+
+**Available HTTP Methods:**
+
+```swift
+// GET request - List all stories
+let stories: [Story] = try await authManager.get(path: "/api/stories")
+
+// GET request - Single story by ID (using path parameter)
+let storyId = "123"
+let story: Story = try await authManager.get(path: "/api/stories/\(storyId)")
+
+// GET with query parameters (filtering, pagination, etc.)
+let queryItems = [
+    URLQueryItem(name: "page", value: "1"),
+    URLQueryItem(name: "limit", value: "20"),
+    URLQueryItem(name: "category", value: "tech")
+]
+let stories: [Story] = try await authManager.get(
+    path: "/api/stories",
+    queryItems: queryItems
+)
+// Makes request to: /api/stories?page=1&limit=20&category=tech
+
+// GET with optional query parameters
+func searchStories(authorId: String? = nil, tag: String? = nil) async throws -> [Story] {
+    var queryItems: [URLQueryItem] = []
+
+    if let authorId = authorId {
+        queryItems.append(URLQueryItem(name: "author_id", value: authorId))
+    }
+
+    if let tag = tag {
+        queryItems.append(URLQueryItem(name: "tag", value: tag))
+    }
+
+    return try await authManager.get(
+        path: "/api/stories/search",
+        queryItems: queryItems.isEmpty ? nil : queryItems
+    )
+}
+
+// POST request - Create new story
+struct CreateStoryRequest: Codable, Sendable {
+    let title: String
+    let content: String
+}
+
+let newStory = CreateStoryRequest(title: "My Story", content: "Content...")
+let createdStory: Story = try await authManager.post(
+    path: "/api/stories",
+    body: newStory
+)
+
+// PUT request - Update entire story
+struct UpdateStoryRequest: Codable, Sendable {
+    let title: String
+    let content: String
+    let author: String
+}
+
+let updateData = UpdateStoryRequest(title: "Updated", content: "New content", author: "John")
+let updatedStory: Story = try await authManager.put(
+    path: "/api/stories/123",
+    body: updateData
+)
+
+// PATCH request - Partial update
+struct PatchStoryRequest: Codable, Sendable {
+    let title: String?
+    let content: String?
+}
+
+let partialUpdate = PatchStoryRequest(title: "New Title", content: nil)
+let patchedStory: Story = try await authManager.patch(
+    path: "/api/stories/123",
+    body: partialUpdate
+)
+
+// DELETE request
+struct DeleteResponse: Codable, Sendable {
+    let success: Bool
+    let message: String?
+}
+
+let result: DeleteResponse = try await authManager.delete(path: "/api/stories/123")
+```
+
+**Key Benefits:**
+- ✅ Automatic Bearer token authentication
+- ✅ Uses the same base URL from initialization
+- ✅ Automatic JSON encoding/decoding
+- ✅ Snake case conversion (Swift camelCase ↔️ API snake_case)
+- ✅ ISO8601 date handling
+
+**Complete Example - Fetching Single Resource:**
+
+```swift
+struct StoryDetailView: View {
+    let storyId: String
+    @EnvironmentObject var authManager: DLAuthManager
+    @State private var story: Story?
+    @State private var isLoading = false
+    @State private var error: String?
+
+    var body: some View {
+        Group {
+            if isLoading {
+                ProgressView("Loading...")
+            } else if let error = error {
+                Text("Error: \(error)")
+                    .foregroundColor(.red)
+            } else if let story = story {
+                VStack(alignment: .leading, spacing: 16) {
+                    Text(story.title)
+                        .font(.title)
+                    Text(story.content)
+                }
+                .padding()
+            }
+        }
+        .task {
+            await loadStory()
+        }
+    }
+
+    private func loadStory() async {
+        isLoading = true
+        error = nil
+
+        do {
+            // Fetch single story by ID
+            story = try await authManager.get(path: "/api/stories/\(storyId)")
+        } catch {
+            self.error = error.localizedDescription
+        }
+
+        isLoading = false
     }
 }
 ```
@@ -498,13 +686,84 @@ func refreshSession() async throws -> DLSession
 ```
 
 #### onAuthStateChange(_:)
-Listen to authentication state changes.
+Set a handler to listen for authentication state changes.
 
 ```swift
 func onAuthStateChange(
-    _ handler: @escaping (DLAuthState) -> Void
-) -> AnyCancellable
+    _ handler: @escaping (DLAuthState, DLSession?) -> Void
+)
 ```
+
+**Note**: Only one handler can be active at a time. Setting a new handler will replace the previous one.
+
+#### removeAuthStateHandler()
+Remove the auth state change handler.
+
+```swift
+func removeAuthStateHandler()
+```
+
+### Authenticated API Request Methods
+
+#### get(path:queryItems:headers:)
+Make an authenticated GET request.
+
+```swift
+func get<T: Decodable>(
+    path: String,
+    queryItems: [URLQueryItem]? = nil,
+    headers: [String: String]? = nil
+) async throws -> T
+```
+
+#### post(path:body:queryItems:headers:)
+Make an authenticated POST request.
+
+```swift
+func post<T: Decodable>(
+    path: String,
+    body: Encodable? = nil,
+    queryItems: [URLQueryItem]? = nil,
+    headers: [String: String]? = nil
+) async throws -> T
+```
+
+#### put(path:body:queryItems:headers:)
+Make an authenticated PUT request.
+
+```swift
+func put<T: Decodable>(
+    path: String,
+    body: Encodable? = nil,
+    queryItems: [URLQueryItem]? = nil,
+    headers: [String: String]? = nil
+) async throws -> T
+```
+
+#### patch(path:body:queryItems:headers:)
+Make an authenticated PATCH request.
+
+```swift
+func patch<T: Decodable>(
+    path: String,
+    body: Encodable? = nil,
+    queryItems: [URLQueryItem]? = nil,
+    headers: [String: String]? = nil
+) async throws -> T
+```
+
+#### delete(path:queryItems:headers:)
+Make an authenticated DELETE request.
+
+```swift
+func delete<T: Decodable>(
+    path: String,
+    queryItems: [URLQueryItem]? = nil,
+    headers: [String: String]? = nil
+) async throws -> T
+```
+
+**Note**: All authenticated API methods automatically include the Bearer token in the Authorization header. They use the base URL specified during DLAuthManager initialization.
 
 ## Models
 
@@ -531,6 +790,9 @@ public struct DLSession: Codable {
     public let expiresAt: Date?
     public let tokenType: String?
     public let user: DLUser?
+
+    // Helper property
+    public var notExpired: Bool  // Returns true if session is not expired
 }
 ```
 
@@ -545,9 +807,32 @@ public struct DLAuthResponse: Codable {
 ### DLAuthState
 ```swift
 public enum DLAuthState {
-    case signedIn(DLSession)
-    case signedOut
-    case unknown
+    case initialSession  // Fired immediately when listener is attached
+    case signedIn        // User signed in successfully
+    case signedOut       // User signed out
+    case unknown         // Unknown state
+}
+```
+
+**Note**: When using `onAuthStateChange`, the handler receives two parameters: `(DLAuthState, DLSession?)`. The `.initialSession` state is fired immediately when you attach a listener, with the session passed as the second parameter. This is useful for handling app restarts or hard refreshes where you need to check if a valid session exists.
+
+**Usage Example**:
+```swift
+authManager.onAuthStateChange { state, session in
+    switch state {
+    case .initialSession:
+        if let session = session, session.notExpired {
+            // Valid session exists - user is authenticated
+        } else {
+            // No valid session - show login
+        }
+    case .signedIn:
+        // User just signed in
+    case .signedOut:
+        // User signed out
+    case .unknown:
+        // Unknown state
+    }
 }
 ```
 

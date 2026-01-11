@@ -1,5 +1,4 @@
 import Foundation
-import Combine
 
 // MARK: - DLAuthManager Configuration
 public struct DLAuthConfig: Sendable {
@@ -56,14 +55,10 @@ public final class DLAuthManager: ObservableObject {
     private let config: DLAuthConfig
     private let networkClient: NetworkClient
     private let storage: KeychainStorage
-    private let authStateSubject = PassthroughSubject<DLAuthState, Never>()
+    private var authStateHandler: ((DLAuthState, DLSession?) -> Void)?
 
     @Published public private(set) var currentSession: DLSession?
     @Published public private(set) var currentUser: DLUser?
-
-    public var authStatePublisher: AnyPublisher<DLAuthState, Never> {
-        authStateSubject.eraseToAnyPublisher()
-    }
 
     public init(url: URL, apiPaths: DLAuthAPIPaths = DLAuthAPIPaths()) {
         self.config = DLAuthConfig(baseURL: url, apiPaths: apiPaths)
@@ -87,12 +82,12 @@ public final class DLAuthManager: ObservableObject {
                 currentSession = session
                 networkClient.accessToken = session.accessToken
                 currentUser = session.user
-                authStateSubject.send(.signedIn(session))
+                authStateHandler?(.initialSession, session)
             } else {
-                authStateSubject.send(.signedOut)
+                authStateHandler?(.initialSession, nil)
             }
         } catch {
-            authStateSubject.send(.signedOut)
+            authStateHandler?(.initialSession, nil)
         }
     }
 
@@ -101,7 +96,7 @@ public final class DLAuthManager: ObservableObject {
         currentSession = session
         networkClient.accessToken = session.accessToken
         currentUser = session.user
-        authStateSubject.send(.signedIn(session))
+        authStateHandler?(.signedIn, session)
     }
 
     private func clearSession() async throws {
@@ -109,11 +104,12 @@ public final class DLAuthManager: ObservableObject {
         currentSession = nil
         networkClient.accessToken = nil
         currentUser = nil
-        authStateSubject.send(.signedOut)
+        authStateHandler?(.signedOut, nil)
     }
 
     // MARK: - Sign Up
 
+    @discardableResult
     public func signUp(email: String, password: String, metadata: [String: AnyCodable]? = nil) async throws -> DLAuthResponse {
         struct SignUpRequest: Encodable {
             let email: String
@@ -142,6 +138,7 @@ public final class DLAuthManager: ObservableObject {
         case username
     }
 
+    @discardableResult
     public func signIn(identifier: String, password: String, type: SignInIdentifierType = .email) async throws -> DLAuthResponse {
         struct SignInRequest: Encodable, Sendable {
             let email: String?
@@ -172,6 +169,7 @@ public final class DLAuthManager: ObservableObject {
 
     // MARK: - Sign In with Custom Credentials
 
+    @discardableResult
     public func signIn<T: Encodable & Sendable>(credentials: T) async throws -> DLAuthResponse {
         let response: DLAuthResponse = try await networkClient.request(
             path: config.apiPaths.signIn,
@@ -208,6 +206,7 @@ public final class DLAuthManager: ObservableObject {
 
     // MARK: - Get Current User
 
+    @discardableResult
     public func getCurrentUser() async throws -> DLUser {
         guard currentSession != nil else {
             throw DLAuthError.noSession
@@ -241,6 +240,7 @@ public final class DLAuthManager: ObservableObject {
 
     // MARK: - Verify OTP
 
+    @discardableResult
     public func verifyOTP(email: String, token: String, type: DLOTPType = .email) async throws -> DLAuthResponse {
         struct VerifyOTPRequest: Encodable {
             let email: String
@@ -279,6 +279,7 @@ public final class DLAuthManager: ObservableObject {
 
     // MARK: - Reset Password
 
+    @discardableResult
     public func resetPassword(token: String, newPassword: String) async throws -> DLAuthResponse {
         struct ResetPasswordRequest: Encodable {
             let token: String
@@ -301,6 +302,7 @@ public final class DLAuthManager: ObservableObject {
 
     // MARK: - Update Password
 
+    @discardableResult
     public func updatePassword(newPassword: String) async throws -> DLAuthResponse {
         guard currentSession != nil else {
             throw DLAuthError.noSession
@@ -327,6 +329,7 @@ public final class DLAuthManager: ObservableObject {
 
     // MARK: - Refresh Session
 
+    @discardableResult
     public func refreshSession() async throws -> DLSession {
         guard let currentSession = currentSession, let refreshToken = currentSession.refreshToken else {
             throw DLAuthError.noSession
@@ -349,10 +352,41 @@ public final class DLAuthManager: ObservableObject {
 
     // MARK: - Auth State Change Listener
 
-    public func onAuthStateChange(_ handler: @escaping (DLAuthState) -> Void) -> AnyCancellable {
-        authStateSubject.sink { state in
-            handler(state)
-        }
+    /// Set a handler to listen for authentication state changes.
+    /// - Parameter handler: The closure to call when auth state changes
+    /// - Note: Only one handler can be active at a time. Setting a new handler will replace the previous one.
+    ///
+    /// Example:
+    /// ```swift
+    /// dlAuthManager.onAuthStateChange { state, session in
+    ///     switch state {
+    ///     case .initialSession:
+    ///         // Check if session exists on app start
+    ///         if let session = session, session.notExpired {
+    ///             // Navigate to home
+    ///         } else {
+    ///             // Navigate to login
+    ///         }
+    ///     case .signedIn:
+    ///         // Navigate to home
+    ///     case .signedOut:
+    ///         // Navigate to login
+    ///     case .unknown:
+    ///         // Handle error
+    ///     }
+    /// }
+    /// ```
+    public func onAuthStateChange(_ handler: @escaping (DLAuthState, DLSession?) -> Void) {
+        // Store the handler
+        authStateHandler = handler
+
+        // Immediately call with current state
+        handler(.initialSession, currentSession)
+    }
+
+    /// Remove the auth state change handler
+    public func removeAuthStateHandler() {
+        authStateHandler = nil
     }
 
     // MARK: - Check Session Validity
@@ -373,5 +407,116 @@ public final class DLAuthManager: ObservableObject {
 
     public func getAccessToken() -> String? {
         currentSession?.accessToken
+    }
+
+    // MARK: - Authenticated API Requests
+
+    /// Make an authenticated GET request to your API
+    /// - Parameters:
+    ///   - path: The API endpoint path (e.g., "/api/user/stories")
+    ///   - queryItems: Optional query parameters
+    ///   - headers: Optional additional headers
+    /// - Returns: Decoded response of type T
+    nonisolated public func get<T: Decodable>(
+        path: String,
+        queryItems: [URLQueryItem]? = nil,
+        headers: [String: String]? = nil
+    ) async throws -> T {
+        return try await networkClient.request(
+            path: path,
+            method: .get,
+            queryItems: queryItems,
+            headers: headers,
+            requiresAuth: true
+        )
+    }
+
+    /// Make an authenticated POST request to your API
+    /// - Parameters:
+    ///   - path: The API endpoint path
+    ///   - body: The request body (will be JSON encoded)
+    ///   - queryItems: Optional query parameters
+    ///   - headers: Optional additional headers
+    /// - Returns: Decoded response of type T
+    nonisolated public func post<T: Decodable>(
+        path: String,
+        body: (any Encodable & Sendable)? = nil,
+        queryItems: [URLQueryItem]? = nil,
+        headers: [String: String]? = nil
+    ) async throws -> T {
+        return try await networkClient.request(
+            path: path,
+            method: .post,
+            body: body,
+            queryItems: queryItems,
+            headers: headers,
+            requiresAuth: true
+        )
+    }
+
+    /// Make an authenticated PUT request to your API
+    /// - Parameters:
+    ///   - path: The API endpoint path
+    ///   - body: The request body (will be JSON encoded)
+    ///   - queryItems: Optional query parameters
+    ///   - headers: Optional additional headers
+    /// - Returns: Decoded response of type T
+    nonisolated public func put<T: Decodable>(
+        path: String,
+        body: (any Encodable & Sendable)? = nil,
+        queryItems: [URLQueryItem]? = nil,
+        headers: [String: String]? = nil
+    ) async throws -> T {
+        return try await networkClient.request(
+            path: path,
+            method: .put,
+            body: body,
+            queryItems: queryItems,
+            headers: headers,
+            requiresAuth: true
+        )
+    }
+
+    /// Make an authenticated PATCH request to your API
+    /// - Parameters:
+    ///   - path: The API endpoint path
+    ///   - body: The request body (will be JSON encoded)
+    ///   - queryItems: Optional query parameters
+    ///   - headers: Optional additional headers
+    /// - Returns: Decoded response of type T
+    nonisolated public func patch<T: Decodable>(
+        path: String,
+        body: (any Encodable & Sendable)? = nil,
+        queryItems: [URLQueryItem]? = nil,
+        headers: [String: String]? = nil
+    ) async throws -> T {
+        return try await networkClient.request(
+            path: path,
+            method: .patch,
+            body: body,
+            queryItems: queryItems,
+            headers: headers,
+            requiresAuth: true
+        )
+    }
+
+    /// Make an authenticated DELETE request to your API
+    /// - Parameters:
+    ///   - path: The API endpoint path
+    ///   - queryItems: Optional query parameters
+    ///   - headers: Optional additional headers
+    /// - Returns: Decoded response of type T
+    nonisolated public func delete<T: Decodable>(
+        path: String,
+        queryItems: [URLQueryItem]? = nil,
+        headers: [String: String]? = nil
+    ) async throws -> T {
+        return try await networkClient.request(
+            path: path,
+            method: .delete,
+            queryItems: queryItems,
+            headers: headers,
+            requiresAuth: true
+        )
     }
 }

@@ -111,6 +111,14 @@ public struct DLSession: Codable, Sendable {
         self.tokenType = tokenType
         self.user = user
     }
+
+    // Helper to check if session is not expired
+    public var notExpired: Bool {
+        guard let expiresAt = expiresAt else {
+            return true  // If no expiry date, consider it valid
+        }
+        return expiresAt > Date()
+    }
 }
 
 // MARK: - Auth Response
@@ -175,9 +183,10 @@ public enum DLOTPType: String, Codable, Sendable {
 
 // MARK: - Auth State
 public enum DLAuthState: Sendable {
-    case signedIn(DLSession)
-    case signedOut
-    case unknown
+    case initialSession  // Initial state on app load
+    case signedIn        // User signed in successfully
+    case signedOut       // User signed out
+    case unknown         // Unknown state
 }
 
 // MARK: - AnyCodable for flexible metadata
